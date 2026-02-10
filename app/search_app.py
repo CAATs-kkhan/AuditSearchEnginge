@@ -1,19 +1,25 @@
 """
-Audit Document Search Engine - Phase 4 with Table Extraction
-=============================================================
-A search tool for auditors with NER and PDF Table Extraction.
+Audit Document Search Engine - Phase 9 with AI Features
+========================================================
+A search tool for auditors with NER, Topic Modelling, and Advanced AI Features.
 
 Features:
 - Simple, Boolean, Wildcard, Fuzzy search
 - Named Entity Recognition (NER)
-- PDF Table Extraction (NEW!)
-  - Extract tables from multiple PDFs
-  - Consolidate to single Excel file
-- Entity summaries and statistics
+- PDF Table Extraction
+- Topic Modelling (LDA)
+- Sentiment & Risk Analysis
+- AI Features (NEW!):
+  - Document Summarization (using BART)
+  - Q&A Chat with Documents (RAG with ChromaDB)
+  - Anomaly Detection (Isolation Forest)
 - Export to Excel
 
 How to run:
     streamlit run search_app.py
+
+New Dependencies for AI Features:
+    pip install transformers torch sentence-transformers chromadb
 """
 
 import streamlit as st
@@ -91,6 +97,39 @@ try:
 except ImportError:
     PDF2IMAGE_AVAILABLE = False
 
+# Try to import transformers for summarization
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+
+# Try to import sentence-transformers for embeddings
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+# Try to import faiss for vector storage (replacing chromadb due to Python 3.14 issues)
+FAISS_AVAILABLE = False
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    pass
+
+# Legacy chromadb flag for compatibility
+CHROMADB_AVAILABLE = FAISS_AVAILABLE
+CHROMADB_ERROR = None if FAISS_AVAILABLE else "Using FAISS instead of ChromaDB"
+
+# Try to import numpy for anomaly detection
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
 # Find Poppler path for pdf2image (Windows)
 POPPLER_PATH = None
 if PDF2IMAGE_AVAILABLE:
@@ -122,6 +161,8 @@ INDEX_FILE = BASE_DIR / "search_index.json"
 ENTITIES_FILE = BASE_DIR / "entities_index.json"
 TOPICS_FILE = BASE_DIR / "topics_index.json"
 SENTIMENT_FILE = BASE_DIR / "sentiment_index.json"
+SUMMARIES_FILE = BASE_DIR / "summaries_index.json"
+CHROMA_DIR = BASE_DIR / "chroma_db"
 DOCUMENTS_FOLDER.mkdir(exist_ok=True)
 
 # =============================================================================
@@ -1415,6 +1456,352 @@ def run_sentiment_analysis(index):
 
 
 # =============================================================================
+# AI SUMMARIZATION FUNCTIONS
+# =============================================================================
+
+# Summarization model (lazy loaded)
+_summarizer_model = None
+_summarizer_tokenizer = None
+
+def get_summarizer():
+    """Get or initialize the summarization model and tokenizer."""
+    global _summarizer_model, _summarizer_tokenizer
+    if _summarizer_model is None and TRANSFORMERS_AVAILABLE:
+        try:
+            # Using t5-small (~250MB) instead of BART (~1.6GB) for faster downloads
+            model_name = "t5-small"
+            _summarizer_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        except Exception as e:
+            return None, None
+    return _summarizer_model, _summarizer_tokenizer
+
+
+def summarize_text(text, max_length=150, min_length=30):
+    """Generate summary of text using T5 model."""
+    if not TRANSFORMERS_AVAILABLE:
+        return "[Summarization not available - install transformers]"
+
+    model, tokenizer = get_summarizer()
+    if model is None or tokenizer is None:
+        return "[Model loading failed]"
+
+    # Chunk long text (model has token limit ~512 tokens for t5-small)
+    max_chunk = 512
+    if len(text) > max_chunk:
+        text = text[:max_chunk]
+
+    # Skip if text is too short
+    if len(text) < 100:
+        return "[Text too short to summarize]"
+
+    try:
+        # T5 requires "summarize: " prefix
+        input_text = "summarize: " + text
+        inputs = tokenizer(input_text, return_tensors="pt", max_length=512, truncation=True)
+        summary_ids = model.generate(
+            inputs["input_ids"],
+            max_length=max_length,
+            min_length=min_length,
+            num_beams=4,
+            early_stopping=True
+        )
+        summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        return summary
+    except Exception as e:
+        return f"[Summarization error: {str(e)}]"
+
+
+def load_summaries():
+    """Load summaries index from file."""
+    if SUMMARIES_FILE.exists():
+        with open(SUMMARIES_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"documents": {}}
+
+
+def save_summaries(summaries):
+    """Save summaries index to file."""
+    with open(SUMMARIES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(summaries, f, ensure_ascii=False, indent=2)
+
+
+# =============================================================================
+# RAG (RETRIEVAL AUGMENTED GENERATION) FUNCTIONS - Using FAISS
+# =============================================================================
+
+# Embedding model and FAISS index (lazy loaded)
+_embedding_model = None
+_faiss_index = None
+_faiss_chunks = []  # Store chunks for retrieval
+_faiss_metadata = []  # Store metadata (doc_id, chunk_idx)
+
+FAISS_INDEX_FILE = BASE_DIR / "faiss_index.bin"
+FAISS_DATA_FILE = BASE_DIR / "faiss_data.json"
+
+
+def get_embedding_model():
+    """Get or initialize the sentence transformer model."""
+    global _embedding_model
+    if _embedding_model is None and SENTENCE_TRANSFORMERS_AVAILABLE:
+        try:
+            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception as e:
+            return None
+    return _embedding_model
+
+
+def get_faiss_index():
+    """Get or initialize the FAISS index."""
+    global _faiss_index, _faiss_chunks, _faiss_metadata
+    if _faiss_index is None and FAISS_AVAILABLE:
+        # Try to load existing index
+        if FAISS_INDEX_FILE.exists() and FAISS_DATA_FILE.exists():
+            try:
+                _faiss_index = faiss.read_index(str(FAISS_INDEX_FILE))
+                with open(FAISS_DATA_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    _faiss_chunks = data.get('chunks', [])
+                    _faiss_metadata = data.get('metadata', [])
+            except Exception:
+                _faiss_index = None
+    return _faiss_index
+
+
+def save_faiss_index():
+    """Save FAISS index and data to disk."""
+    global _faiss_index, _faiss_chunks, _faiss_metadata
+    if _faiss_index is not None:
+        try:
+            faiss.write_index(_faiss_index, str(FAISS_INDEX_FILE))
+            with open(FAISS_DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'chunks': _faiss_chunks,
+                    'metadata': _faiss_metadata
+                }, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+def get_chroma_collection():
+    """Compatibility function - returns FAISS index status."""
+    return get_faiss_index()
+
+
+def chunk_text(text, chunk_size=500, overlap=50):
+    """Split text into overlapping chunks for embedding."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
+        if start < 0:
+            break
+    return chunks
+
+
+def index_document_embeddings(doc_id, text):
+    """Create embeddings for document chunks and store in FAISS."""
+    global _faiss_index, _faiss_chunks, _faiss_metadata
+
+    if not SENTENCE_TRANSFORMERS_AVAILABLE or not FAISS_AVAILABLE:
+        return False
+
+    model = get_embedding_model()
+    if not model:
+        return False
+
+    try:
+        chunks = chunk_text(text)
+        if not chunks:
+            return False
+
+        # Get embeddings
+        embeddings = model.encode(chunks)
+        embeddings = np.array(embeddings).astype('float32')
+
+        # Initialize or update FAISS index
+        if _faiss_index is None:
+            dimension = embeddings.shape[1]
+            _faiss_index = faiss.IndexFlatL2(dimension)
+            _faiss_chunks = []
+            _faiss_metadata = []
+
+        # Add to index
+        _faiss_index.add(embeddings)
+
+        # Store chunks and metadata
+        for i, chunk in enumerate(chunks):
+            _faiss_chunks.append(chunk)
+            _faiss_metadata.append({"doc_id": doc_id, "chunk_idx": i})
+
+        return True
+    except Exception as e:
+        return False
+
+
+def search_similar_chunks(query, n_results=5):
+    """Find most relevant document chunks for a query using FAISS."""
+    global _faiss_index, _faiss_chunks, _faiss_metadata
+
+    if not SENTENCE_TRANSFORMERS_AVAILABLE or not FAISS_AVAILABLE:
+        return None
+
+    model = get_embedding_model()
+    index = get_faiss_index()
+
+    if not model or index is None:
+        return None
+
+    try:
+        # Check if index has any documents
+        if index.ntotal == 0:
+            return None
+
+        # Get query embedding
+        query_embedding = model.encode([query])
+        query_embedding = np.array(query_embedding).astype('float32')
+
+        # Search
+        k = min(n_results, index.ntotal)
+        distances, indices = index.search(query_embedding, k)
+
+        # Format results similar to ChromaDB format
+        documents = []
+        metadatas = []
+        for idx in indices[0]:
+            if idx < len(_faiss_chunks):
+                documents.append(_faiss_chunks[idx])
+                metadatas.append(_faiss_metadata[idx])
+
+        return {
+            'documents': [documents],
+            'metadatas': [metadatas],
+            'distances': [distances[0].tolist()]
+        }
+    except Exception as e:
+        return None
+
+
+def generate_answer(query, context):
+    """Generate answer using context. Uses simple extractive approach."""
+    if not context:
+        return "No relevant information found in the documents."
+    return f"Based on the documents:\n\n{context}"
+
+
+def index_all_embeddings(index):
+    """Index embeddings for all documents in the index."""
+    global _faiss_index, _faiss_chunks, _faiss_metadata
+
+    if not SENTENCE_TRANSFORMERS_AVAILABLE or not FAISS_AVAILABLE:
+        return 0, "Required libraries not available"
+
+    # Reset index for fresh indexing
+    _faiss_index = None
+    _faiss_chunks = []
+    _faiss_metadata = []
+
+    indexed_count = 0
+    for doc_id, doc_data in index.get("documents", {}).items():
+        text = doc_data.get("text", "")
+        if text and len(text) > 100:
+            if index_document_embeddings(doc_id, text):
+                indexed_count += 1
+
+    # Save index to disk
+    save_faiss_index()
+
+    return indexed_count, None
+
+
+# =============================================================================
+# ANOMALY DETECTION FUNCTIONS
+# =============================================================================
+
+def extract_amounts_from_text(text):
+    """Extract monetary amounts from text."""
+    amounts = []
+    # Match various currency formats
+    patterns = [
+        r'\$\s?([\d,]+(?:\.\d{2})?)',           # $1,234.56
+        r'Rs\.?\s?([\d,]+(?:\.\d{2})?)',        # Rs. 1,234.56
+        r'PKR\s?([\d,]+(?:\.\d{2})?)',          # PKR 1,234.56
+        r'USD\s?([\d,]+(?:\.\d{2})?)',          # USD 1,234.56
+        r'([\d,]+(?:\.\d{2})?)\s?(?:million)',  # 1.5 million
+        r'([\d,]+(?:\.\d{2})?)\s?(?:billion)',  # 1.5 billion
+        r'([\d,]+(?:\.\d{2})?)\s?(?:thousand)', # 1.5 thousand
+        r'([\d,]+(?:\.\d{2})?)\s?(?:lac|lakh)', # 1.5 lac/lakh
+        r'([\d,]+(?:\.\d{2})?)\s?(?:crore)',    # 1.5 crore
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            try:
+                # Remove commas and convert to float
+                amount = float(match.replace(',', ''))
+                if amount > 0:  # Only positive amounts
+                    amounts.append(amount)
+            except (ValueError, AttributeError):
+                pass
+    return amounts
+
+
+def detect_anomalies(index):
+    """Detect anomalies in document amounts using statistical methods."""
+    if not SKLEARN_AVAILABLE or not NUMPY_AVAILABLE:
+        return {"error": "scikit-learn or numpy not installed"}
+
+    from sklearn.ensemble import IsolationForest
+
+    doc_amounts = {}
+    all_amounts = []
+    amount_to_doc = []  # Track which document each amount belongs to
+
+    for doc_id, doc_data in index.get("documents", {}).items():
+        text = doc_data.get("text", "")
+        amounts = extract_amounts_from_text(text)
+        doc_amounts[doc_id] = amounts
+        for amount in amounts:
+            all_amounts.append(amount)
+            amount_to_doc.append(doc_id)
+
+    if len(all_amounts) < 10:
+        return {"error": f"Not enough data for anomaly detection (found {len(all_amounts)} amounts, need at least 10)"}
+
+    try:
+        # Use Isolation Forest for anomaly detection
+        amounts_array = np.array(all_amounts).reshape(-1, 1)
+        clf = IsolationForest(contamination=0.1, random_state=42)
+        predictions = clf.fit_predict(amounts_array)
+
+        # Find anomalous amounts
+        anomalies = []
+        for idx, (amount, doc_id, pred) in enumerate(zip(all_amounts, amount_to_doc, predictions)):
+            if pred == -1:  # -1 indicates anomaly
+                anomalies.append({
+                    "document": doc_id,
+                    "amount": amount,
+                    "formatted_amount": f"${amount:,.2f}" if amount < 1000000 else f"${amount/1000000:.2f}M",
+                    "type": "statistical_outlier"
+                })
+
+        # Sort by amount (largest first)
+        anomalies.sort(key=lambda x: x["amount"], reverse=True)
+
+        return {
+            "anomalies": anomalies,
+            "total_amounts": len(all_amounts),
+            "anomaly_count": len(anomalies),
+            "documents_analyzed": len(doc_amounts)
+        }
+
+    except Exception as e:
+        return {"error": f"Anomaly detection error: {str(e)}"}
+
+
+# =============================================================================
 # STREAMLIT USER INTERFACE
 # =============================================================================
 
@@ -1460,6 +1847,17 @@ def main():
         st.sidebar.warning("📷 OCR: pytesseract not installed")
     else:
         st.sidebar.info("📷 OCR: Not available")
+
+    # AI Features Status
+    if TRANSFORMERS_AVAILABLE:
+        st.sidebar.success("🤖 AI Summarization: Available")
+    else:
+        st.sidebar.info("🤖 AI Summarization: Not installed")
+
+    if SENTENCE_TRANSFORMERS_AVAILABLE and FAISS_AVAILABLE:
+        st.sidebar.success("💬 Q&A Chat: Available (FAISS)")
+    else:
+        st.sidebar.info("💬 Q&A Chat: Not installed")
 
     # Sidebar: Index documents
     st.sidebar.subheader("📁 Index Documents")
@@ -1508,7 +1906,11 @@ def main():
         """)
 
     # Create tabs for different features
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🔎 Search", "👤 Entities (NER)", "📊 Statistics", "📋 Table Extraction", "🏷️ Topics", "⚠️ Sentiment"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "🔎 Search", "👤 Entities (NER)", "📊 Statistics",
+        "📋 Table Extraction", "🏷️ Topics", "⚠️ Sentiment",
+        "🤖 AI Assistant"
+    ])
 
     # ========================
     # TAB 1: SEARCH
@@ -2172,6 +2574,247 @@ def main():
                 2. Click "Analyze Sentiment"
                 3. Review high-risk documents first
                 4. Check flagged keywords in each document
+                """)
+
+    # ========================
+    # TAB 7: AI ASSISTANT
+    # ========================
+    with tab7:
+        st.header("🤖 AI Assistant")
+        st.markdown("*Intelligent audit assistance with AI-powered features*")
+
+        ai_tab1, ai_tab2, ai_tab3 = st.tabs([
+            "📝 Summarization", "💬 Q&A Chat", "🔍 Anomaly Detection"
+        ])
+
+        # ========================
+        # AI SUB-TAB 1: SUMMARIZATION
+        # ========================
+        with ai_tab1:
+            st.subheader("📝 Document Summarization")
+            st.markdown("*Auto-generate summaries of audit documents using AI*")
+
+            if not TRANSFORMERS_AVAILABLE:
+                st.error("❌ transformers not installed. Run: `pip install transformers torch`")
+                st.info("**Note:** First run will download the BART model (~1.6GB)")
+            else:
+                st.success("✅ Summarization available")
+
+                # Load existing summaries
+                summaries = load_summaries()
+
+                # Document selector
+                doc_options = list(index.get("documents", {}).keys())
+                if doc_options:
+                    selected_doc = st.selectbox(
+                        "Select Document to Summarize",
+                        doc_options,
+                        key="sum_doc_select"
+                    )
+
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        if st.button("📝 Generate Summary", type="primary"):
+                            with st.spinner("Generating summary... (first run downloads model)"):
+                                text = index["documents"][selected_doc]["text"]
+                                # Limit input text
+                                summary = summarize_text(text[:5000])
+
+                                # Save summary
+                                summaries["documents"][selected_doc] = {
+                                    "summary": summary,
+                                    "generated_at": datetime.now().isoformat()
+                                }
+                                save_summaries(summaries)
+
+                                st.success("✅ Summary generated!")
+                                st.rerun()
+
+                    # Show existing summary if available
+                    if selected_doc in summaries.get("documents", {}):
+                        st.divider()
+                        st.markdown("### Summary")
+                        summary_data = summaries["documents"][selected_doc]
+                        st.info(summary_data["summary"])
+                        st.caption(f"Generated: {summary_data.get('generated_at', 'Unknown')[:19]}")
+
+                    # Show all summaries
+                    if summaries.get("documents"):
+                        st.divider()
+                        st.subheader("📚 All Generated Summaries")
+
+                        for doc_name, sum_data in summaries["documents"].items():
+                            with st.expander(f"📄 {doc_name}"):
+                                st.markdown(sum_data["summary"])
+                                st.caption(f"Generated: {sum_data.get('generated_at', 'Unknown')[:19]}")
+                else:
+                    st.warning("⚠️ No documents indexed. Please index some documents first.")
+
+        # ========================
+        # AI SUB-TAB 2: Q&A CHAT
+        # ========================
+        with ai_tab2:
+            st.subheader("💬 Ask Questions About Documents")
+            st.markdown("*Query your documents using natural language (RAG)*")
+
+            if not SENTENCE_TRANSFORMERS_AVAILABLE or not FAISS_AVAILABLE:
+                st.error("❌ Required libraries not installed.")
+                st.code("pip install sentence-transformers faiss-cpu", language="bash")
+                st.info("**Note:** First run will download the embedding model (~90MB)")
+            else:
+                st.success("✅ Q&A Chat available (using FAISS)")
+
+                # Check if embeddings are indexed
+                faiss_index = get_faiss_index()
+                if faiss_index is not None:
+                    doc_count_in_db = faiss_index.ntotal
+                    st.caption(f"📊 {doc_count_in_db} document chunks indexed in vector database")
+                else:
+                    doc_count_in_db = 0
+                    st.caption("📊 No documents indexed yet")
+
+                # Index embeddings button (always show)
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if st.button("🔄 Index Embeddings", type="secondary"):
+                        with st.spinner("Indexing document embeddings..."):
+                            indexed_count, error = index_all_embeddings(index)
+                            if error:
+                                st.error(f"Error: {error}")
+                            else:
+                                st.success(f"✅ Indexed {indexed_count} documents!")
+                                st.rerun()
+
+                st.divider()
+
+                # Query input
+                query = st.text_input(
+                    "Ask a question about your documents:",
+                    placeholder="e.g., What were the main audit findings?"
+                )
+
+                if query:
+                    with st.spinner("Searching documents..."):
+                        results = search_similar_chunks(query)
+
+                        if results and results.get('documents') and results['documents'][0]:
+                            st.markdown("### 📋 Relevant Information")
+
+                            # Show top results
+                            for i, (doc, metadata) in enumerate(zip(
+                                results['documents'][0],
+                                results['metadatas'][0]
+                            )):
+                                with st.expander(f"📄 Result {i+1} - {metadata.get('doc_id', 'Unknown')}", expanded=(i==0)):
+                                    st.markdown(doc)
+
+                            # Generate combined answer
+                            st.divider()
+                            st.markdown("### 💡 Combined Context")
+                            context = "\n\n---\n\n".join(results['documents'][0][:3])
+                            answer = generate_answer(query, context)
+                            st.info(answer)
+
+                        else:
+                            st.warning("No relevant information found. Try indexing embeddings first.")
+
+            # Help section
+            with st.expander("ℹ️ How Q&A Works"):
+                st.markdown("""
+                **Retrieval-Augmented Generation (RAG):**
+
+                1. Documents are split into chunks
+                2. Each chunk is converted to a vector embedding
+                3. Your question is also converted to a vector
+                4. Most similar chunks are retrieved
+                5. These chunks provide context for answering
+
+                **Tips:**
+                - Click "Index Embeddings" after adding new documents
+                - Ask specific questions for better results
+                - The system finds relevant excerpts, not exact answers
+                """)
+
+        # ========================
+        # AI SUB-TAB 3: ANOMALY DETECTION
+        # ========================
+        with ai_tab3:
+            st.subheader("🔍 Anomaly Detection")
+            st.markdown("*Detect unusual amounts or patterns in documents*")
+
+            if not SKLEARN_AVAILABLE:
+                st.error("❌ scikit-learn not installed. Run: `pip install scikit-learn`")
+            elif not NUMPY_AVAILABLE:
+                st.error("❌ numpy not installed. Run: `pip install numpy`")
+            else:
+                st.success("✅ Anomaly detection available")
+
+                st.markdown("""
+                This feature:
+                - Extracts monetary amounts from all documents
+                - Uses **Isolation Forest** algorithm to detect statistical outliers
+                - Flags unusually large or small amounts that may need review
+                """)
+
+                if st.button("🔍 Run Anomaly Detection", type="primary"):
+                    with st.spinner("Analyzing documents for anomalies..."):
+                        results = detect_anomalies(index)
+
+                        if "error" in results:
+                            st.warning(f"⚠️ {results['error']}")
+                        else:
+                            st.success(f"✅ Analyzed {results['total_amounts']} amounts from {results['documents_analyzed']} documents")
+
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Total Amounts Found", results['total_amounts'])
+                            with col2:
+                                st.metric("Anomalies Detected", results['anomaly_count'])
+
+                            if results["anomalies"]:
+                                st.divider()
+                                st.subheader("⚠️ Detected Anomalies")
+
+                                # Create dataframe for display
+                                anomaly_data = []
+                                for a in results["anomalies"]:
+                                    anomaly_data.append({
+                                        "Document": a["document"],
+                                        "Amount": a["formatted_amount"],
+                                        "Raw Value": a["amount"],
+                                        "Type": a["type"]
+                                    })
+
+                                st.dataframe(anomaly_data, use_container_width=True)
+
+                                st.markdown("**Note:** These amounts are flagged as statistical outliers compared to other amounts in your documents. Review them to determine if they represent actual issues.")
+                            else:
+                                st.info("✅ No anomalies detected. All amounts appear within normal ranges.")
+
+            # Help section
+            with st.expander("ℹ️ About Anomaly Detection"):
+                st.markdown("""
+                **How it works:**
+
+                1. Extracts all monetary values from documents (various formats: $, Rs., PKR, etc.)
+                2. Applies **Isolation Forest** algorithm
+                3. Identifies values that are statistically unusual
+                4. Flags the top 10% as potential anomalies
+
+                **What it detects:**
+                - Unusually large amounts
+                - Unusually small amounts
+                - Values that don't fit the normal pattern
+
+                **Currency formats detected:**
+                - USD: $1,234.56
+                - PKR: Rs. 1,234.56 or PKR 1,234.56
+                - Amounts with qualifiers: million, billion, lac, crore
+
+                **Limitations:**
+                - Requires at least 10 amounts for analysis
+                - Statistical outliers may not be actual issues
+                - Manual review is always recommended
                 """)
 
 
