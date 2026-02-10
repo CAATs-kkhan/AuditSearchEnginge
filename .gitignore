@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env
+
+# Generated index files
+search_index.json
+entities_index.json
+topics_index.json
+sentiment_index.json
+summaries_index.json
+faiss_index.bin
+faiss_data.json
+chroma_db/
+
+# User documents (keep folder structure)
+documents/*
+!documents/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
