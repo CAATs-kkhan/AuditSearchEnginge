@@ -1,0 +1,102 @@
+============================================
+  AUDIT DOCUMENT SEARCH ENGINE
+  Getting Started Guide
+============================================
+
+This guide will help you set up and run the Audit Search Engine.
+
+
+STEP 1: INSTALL PYTHON
+----------------------
+1. Go to: https://www.python.org/downloads/
+2. Download Python 3.11 or 3.12
+3. Run the installer
+4. IMPORTANT: Check the box "Add Python to PATH" at the bottom of the installer
+5. Click "Install Now"
+
+To verify: Open Command Prompt (search "cmd" in Start menu) and type:
+    python --version
+
+You should see: Python 3.11.x or Python 3.12.x
+
+
+STEP 2: RUN SETUP
+-----------------
+1. Open File Explorer
+2. Navigate to this folder (AuditSearchEngine)
+3. Double-click on "SETUP.bat"
+4. Wait for the installation to complete (this may take 5-10 minutes)
+5. Press any key when prompted
+
+
+STEP 3: ADD YOUR DOCUMENTS
+--------------------------
+1. Open the "documents" folder inside AuditSearchEngine
+2. Copy your documents (PDF, Word, Excel, Text files) into this folder
+
+
+STEP 4: RUN THE APPLICATION
+---------------------------
+1. Double-click on "RUN_APP.bat"
+2. Wait a few seconds
+3. Your web browser will open automatically with the search interface
+4. If the browser doesn't open, manually go to: http://localhost:8501
+
+
+USING THE APPLICATION
+---------------------
+1. Click "Re-index All Documents" in the sidebar to index your documents
+2. Type your search query in the search box
+3. View results with highlighted snippets
+4. Use "Fuzzy Search" for partial matches when data quality varies
+
+
+SUPPORTED FILE TYPES
+--------------------
+- PDF files (.pdf)
+- Word documents (.docx)
+- Excel spreadsheets (.xlsx)
+- Text files (.txt)
+
+
+TROUBLESHOOTING
+---------------
+Problem: "Python is not recognized..."
+Solution: Reinstall Python and make sure to check "Add Python to PATH"
+
+Problem: Setup fails with errors
+Solution: Make sure you have internet connection for downloading packages
+
+Problem: Browser doesn't open
+Solution: Manually open http://localhost:8501 in your browser
+
+Problem: Documents not showing
+Solution:
+    1. Make sure documents are in the "documents" folder
+    2. Click "Re-index All Documents" in the sidebar
+
+
+FOLDER STRUCTURE
+----------------
+AuditSearchEngine/
+    ├── app/                  <- Application code
+    │   └── search_app.py     <- Main search application
+    ├── documents/            <- PUT YOUR DOCUMENTS HERE
+    ├── SETUP.bat             <- Run this first
+    ├── RUN_APP.bat           <- Run this to start the app
+    ├── requirements.txt      <- Python packages list
+    └── GETTING_STARTED.txt   <- This file
+
+
+NEXT STEPS (Coming Soon)
+------------------------
+Phase 2: Apache Solr integration for faster search
+Phase 3: NLP features (Named Entity Recognition)
+Phase 4: Urdu language support
+
+
+============================================
+  Need Help?
+  The search engine was created step by step.
+  Each feature will be added gradually.
+============================================

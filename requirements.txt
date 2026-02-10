@@ -1,0 +1,10 @@
+# Audit Search Engine - Minimal Dependencies
+# These packages are pure Python and easy to install on Windows
+
+# Web Interface
+streamlit
+
+# Document Processing
+pypdf              # PDF text extraction
+python-docx        # Word document extraction
+openpyxl           # Excel file extraction
